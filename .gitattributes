@@ -1,0 +1,5 @@
+# GitHub 언어 통계 정상화 — ERD·문서는 제외, .sql 을 SQL 로 집계
+erd/**   linguist-documentation
+docs/**  linguist-documentation
+*.sql    linguist-detectable
+*.sql    linguist-language=SQL
