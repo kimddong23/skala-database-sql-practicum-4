@@ -38,6 +38,9 @@ psql -d ecom_db -f sql/03_explain_mview.sql
 - Q1 GMV·Q2 월별매출/AOV·Q3 카테고리 Top10·Q4 제품 누적매출 RANK·Q5 RFM·Q6 재구매율
 - Q7 재고임계·Q8 효자상품·Q9 쿠폰효과·Q10 상위1%·Q11 NULLIF 0-나눗셈 방어
 
+## ERD
+![ERD](erd/광주_3반_신주용_종합실습4_ERD.png)
+
 ## 분석 리포트
 제출 리포트 [`docs/광주_3반_신주용_종합실습4_리포트.pdf`](docs/광주_3반_신주용_종합실습4_리포트.pdf) 전체 페이지 미리보기.
 
