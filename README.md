@@ -3,7 +3,7 @@
 전자상거래 스키마에서 매출·고객·재고를 분석하고 실행계획을 개선한 실습.
 
 - 작성자 : 광주 3반 신주용
-- 작성일 : 2026-07-21
+- 작성일 : 2026-07-23
 - GitHub : https://github.com/kimddong23/skala-database-sql-practicum-4
 - 주제 : **매출 분석 쿼리 + 실행계획 개선 + Materialized View**
 - DB : `ecom_db (9테이블)` · PostgreSQL 17
@@ -64,6 +64,9 @@ psql -d ecom_db -f sql/03_explain_mview.sql
 ![리포트 p18](docs/pdf_pages/page-18.png)
 ![리포트 p19](docs/pdf_pages/page-19.png)
 ![리포트 p20](docs/pdf_pages/page-20.png)
+![리포트 p21](docs/pdf_pages/page-21.png)
+![리포트 p22](docs/pdf_pages/page-22.png)
+![리포트 p23](docs/pdf_pages/page-23.png)
 
 ## 설계·간결화 방법
 - 집계는 CTE·윈도우로 단계화, NULLIF 로 0-나눗셈 방어
@@ -71,4 +74,5 @@ psql -d ecom_db -f sql/03_explain_mview.sql
 - 반복 집계는 Materialized View(mv_daily_gmv)로 캐시, CONCURRENTLY 갱신 설계
 
 ## 변경 이력
-- 2026-07-21 최초 작성
+- 2026-07-22 최초 작성
+- 2026-07-23 리포트 표준 양식(목차·커버리지표·접속화면) 이식
