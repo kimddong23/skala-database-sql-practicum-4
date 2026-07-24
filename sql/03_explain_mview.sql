@@ -22,7 +22,7 @@ SET search_path = ecom, public;
 -- 1-1. Nested Loop Join (NLJ) : 한쪽이 소량 + 상대편에 인덱스
 --      바깥 행마다 안쪽을 인덱스로 콕 집어 조회 → 단건·소량 최강
 -- -------------------------------------------------------------
-EXPLAIN (ANALYZE)
+EXPLAIN (ANALYZE, BUFFERS)
 SELECT o.order_id, o.order_ts, oi.product_id, oi.qty, oi.line_total
 FROM   orders o
 JOIN   order_items oi ON oi.order_id = o.order_id
@@ -33,7 +33,7 @@ WHERE  o.order_id = 1000;
 --      작은 쪽으로 해시테이블 생성 → 큰 쪽을 흘려보내며 매칭
 --      정렬·인덱스 불필요, 대량 배치 집계의 기본기
 -- -------------------------------------------------------------
-EXPLAIN (ANALYZE)
+EXPLAIN (ANALYZE, BUFFERS)
 SELECT o.order_status, count(oi.order_item_id) AS items
 FROM   orders o
 JOIN   order_items oi ON oi.order_id = o.order_id
@@ -46,7 +46,7 @@ GROUP  BY o.order_status ORDER BY o.order_status;
 -- -------------------------------------------------------------
 SET enable_hashjoin = off;
 SET enable_nestloop = off;
-EXPLAIN (ANALYZE)
+EXPLAIN (ANALYZE, BUFFERS)
 SELECT o.order_status, count(oi.order_item_id) AS items
 FROM   orders o
 JOIN   order_items oi ON oi.order_id = o.order_id
@@ -59,7 +59,7 @@ RESET enable_nestloop;
 --      count(*) 처럼 인덱스만으로 답이 나오면 Index Only Scan(히프 방문 0),
 --      테이블 컬럼까지 읽으면 Bitmap Heap Scan(블록 지도 일괄 방문 — Q1·Q10)
 -- -------------------------------------------------------------
-EXPLAIN (ANALYZE)
+EXPLAIN (ANALYZE, BUFFERS)
 SELECT count(*)
 FROM   orders
 WHERE  order_status IN ('paid','shipped','delivered')
@@ -75,7 +75,7 @@ AND    order_ts >= now() - interval '30 days';
 -- -------------------------------------------------------------
 
 -- [전] 원본 : orders × order_items 조인 후 일 단위 집계
-EXPLAIN (ANALYZE)
+EXPLAIN (ANALYZE, BUFFERS)
 SELECT date_trunc('day', o.order_ts)::date AS day, sum(oi.line_total) AS gmv
 FROM   orders o
 JOIN   order_items oi ON oi.order_id = o.order_id
@@ -83,7 +83,7 @@ WHERE  o.order_status IN ('paid','shipped','delivered')
 GROUP  BY 1 ORDER BY 1 DESC LIMIT 7;
 
 -- [후] MView : 이미 집계된 결과를 바로 읽음 (00_schema 에서 생성)
-EXPLAIN (ANALYZE)
+EXPLAIN (ANALYZE, BUFFERS)
 SELECT day::date AS day, gmv
 FROM   mv_daily_gmv
 ORDER  BY day DESC LIMIT 7;
