@@ -1,301 +1,448 @@
 -- =============================================================
 -- 01_seed.sql
--- E-Commerce 분석 실습 (종합실습 4) — 테스트 데이터 적재
+-- E-Commerce 분석 실습 (종합실습 4) — 실습 데이터 적재
 -- 작성자 : 신주용 / 광주 3반
--- 작성일 : 2026-07-21
 -- 변경 이력 :
---   2026-07-21 최초 작성
+--   - 2026-07-21 최초 작성
+--   - 2026-07-24 실습 제공 시드(ecom) 기준 전면 재구성
 -- =============================================================
 -- 접속 대상 : psql -d ecom_db -f 01_seed.sql
+-- 데이터 설계 의도 :
+--   - 상품 600 · 고객 3,000 · 리프 카테고리 균등 분배(편중 최소화)
+--   - 가격 이력 3구간(SCD2) → 주문 시점 가격 매칭
+--   - 헤비 고객(1~30)이 최근 매출 집중 생성 → Q10 상위 고객 분석용
+--   - 200명 첫 구매 후 30일 내 재구매 보장 → Q6 재구매율 분석용
+--   - 히어로 상품 12개(평점 4.5+ · 리뷰 다수) → Q8 효자 상품 분석용
+--   - 재고 50개 상품 임계치 미달 강제 → Q7 품절 위험 분석용
 -- =============================================================
 
--- 트랜잭션으로 묶어 원자적 적재 (중간 실패 시 롤백)
-BEGIN;
+SET search_path = ecom, public;
+
+-- 재실행 대비 전체 초기화 (시퀀스 포함)
+TRUNCATE TABLE
+  reviews, shipments, payments, order_items, orders,
+  inventory, product_suppliers, product_prices,
+  products, suppliers, addresses, customers, categories, country
+RESTART IDENTITY CASCADE;
 
 -- =============================================================
--- 1. 카테고리 트리 (3단계: 대분류→중분류→소분류)
+-- 1. 마스터 데이터
 -- =============================================================
-INSERT INTO categories(category_id, name, parent_id) VALUES
-  -- 대분류
-  (1, '전자제품',    NULL),
-  (2, '패션',        NULL),
-  (3, '식품',        NULL),
-  (4, '가구/인테리어', NULL),
-  -- 중분류
-  (5, '스마트폰',    1),
-  (6, '노트북',      1),
-  (7, '오디오',      1),
-  (8, '남성의류',    2),
-  (9, '여성의류',    2),
-  (10,'신발',        2),
-  (11,'신선식품',    3),
-  (12,'가공식품',    3),
-  (13,'가구',        4),
-  (14,'조명',        4),
-  -- 소분류
-  (15,'안드로이드폰', 5),
-  (16,'아이폰',      5),
-  (17,'게이밍노트북', 6),
-  (18,'업무용노트북', 6),
-  (19,'블루투스이어폰', 7),
-  (20,'스피커',      7),
-  (21,'청바지',      8),
-  (22,'티셔츠',      8),
-  (23,'원피스',      9),
-  (24,'블라우스',    9),
-  (25,'운동화',     10),
-  (26,'구두',       10),
-  (27,'채소/과일',  11),
-  (28,'육류/수산',  11),
-  (29,'라면/면류',  12),
-  (30,'음료',       12),
-  (31,'소파',       13),
-  (32,'침대',       13),
-  (33,'LED조명',    14),
-  (34,'스탠드조명', 14);
 
--- 시퀀스 갱신
-SELECT setval('categories_category_id_seq', 34);
+-- 국가
+INSERT INTO country(country_code, country_name) VALUES
+('US','United States'),('KR','Korea'),('JP','Japan'),('DE','Germany'),('GB','United Kingdom')
+ON CONFLICT DO NOTHING;
 
--- =============================================================
--- 2. 상품 마스터 (200개)
---    generate_series 기반, 카테고리 소분류에 순환 배분
--- =============================================================
-INSERT INTO products(product_id, name, category_id, base_price)
+-- 카테고리 트리 : 대분류 4 + 소분류 10 (LATERAL 로 부모별 자식 생성)
+WITH roots AS (
+  INSERT INTO categories(parent_id, category_name)
+  VALUES
+    (NULL,'Electronics'),
+    (NULL,'Home & Kitchen'),
+    (NULL,'Fashion'),
+    (NULL,'Sports')
+  RETURNING category_id, category_name
+)
+INSERT INTO categories(parent_id, category_name)
+SELECT r.category_id, v.child_name
+FROM roots r
+JOIN LATERAL (
+  VALUES
+    (CASE WHEN r.category_name='Electronics'     THEN 'Phones' END),
+    (CASE WHEN r.category_name='Electronics'     THEN 'Laptops' END),
+    (CASE WHEN r.category_name='Electronics'     THEN 'Audio' END),
+    (CASE WHEN r.category_name='Home & Kitchen'  THEN 'Appliances' END),
+    (CASE WHEN r.category_name='Home & Kitchen'  THEN 'Cookware' END),
+    (CASE WHEN r.category_name='Fashion'         THEN 'Men' END),
+    (CASE WHEN r.category_name='Fashion'         THEN 'Women' END),
+    (CASE WHEN r.category_name='Fashion'         THEN 'Shoes' END),
+    (CASE WHEN r.category_name='Sports'          THEN 'Outdoor' END),
+    (CASE WHEN r.category_name='Sports'          THEN 'Fitness' END)
+) AS v(child_name) ON v.child_name IS NOT NULL;
+
+-- 공급사 50
+INSERT INTO suppliers(supplier_name, phone)
+SELECT 'Supplier ' || gs::text, '+1-555-10' || lpad(gs::text,3,'0')
+FROM generate_series(1,50) gs;
+
+-- 상품 600 : 리프 카테고리에 라운드로빈 균등 분배 (편중 최소화)
+WITH leaf AS (
+  SELECT category_id,
+        row_number() OVER (ORDER BY random()) AS rn
+  FROM categories
+  WHERE parent_id IS NOT NULL
+),
+leaf_cnt AS (
+  SELECT count(*)::int AS cnt FROM leaf
+),
+prod AS (
+  SELECT gs,
+        row_number() OVER (ORDER BY gs) AS rn
+  FROM generate_series(1,600) gs
+)
+INSERT INTO products(sku, product_name, category_id, unit, active, created_at)
 SELECT
-    s.n,
-    '상품_' || LPAD(s.n::TEXT, 3, '0') AS name,
-    -- 소분류(15~34) 순환 배분
-    15 + ((s.n - 1) % 20) AS category_id,
-    -- 가격 : 카테고리별 대역 설정 (전자 비쌈, 식품 쌈)
-    CASE 15 + ((s.n - 1) % 20)
-        WHEN 15 THEN 450000 + (s.n % 10) * 30000   -- 안드로이드폰
-        WHEN 16 THEN 900000 + (s.n % 10) * 50000   -- 아이폰
-        WHEN 17 THEN 1200000 + (s.n % 10) * 60000  -- 게이밍노트북
-        WHEN 18 THEN 800000 + (s.n % 10) * 40000   -- 업무용노트북
-        WHEN 19 THEN 80000 + (s.n % 10) * 8000     -- 블루투스이어폰
-        WHEN 20 THEN 120000 + (s.n % 10) * 10000   -- 스피커
-        WHEN 21 THEN 35000 + (s.n % 10) * 3000     -- 청바지
-        WHEN 22 THEN 18000 + (s.n % 10) * 2000     -- 티셔츠
-        WHEN 23 THEN 45000 + (s.n % 10) * 4000     -- 원피스
-        WHEN 24 THEN 32000 + (s.n % 10) * 3000     -- 블라우스
-        WHEN 25 THEN 60000 + (s.n % 10) * 5000     -- 운동화
-        WHEN 26 THEN 95000 + (s.n % 10) * 7000     -- 구두
-        WHEN 27 THEN 5000 + (s.n % 10) * 500       -- 채소/과일
-        WHEN 28 THEN 15000 + (s.n % 10) * 1500     -- 육류/수산
-        WHEN 29 THEN 3500 + (s.n % 10) * 300       -- 라면/면류
-        WHEN 30 THEN 2000 + (s.n % 10) * 200       -- 음료
-        WHEN 31 THEN 250000 + (s.n % 10) * 20000   -- 소파
-        WHEN 32 THEN 350000 + (s.n % 10) * 25000   -- 침대
-        WHEN 33 THEN 30000 + (s.n % 10) * 2500     -- LED조명
-        ELSE         22000 + (s.n % 10) * 2000     -- 스탠드조명
-    END AS base_price
-FROM generate_series(1, 200) s(n);
+  'SKU-' || to_char(p.gs,'FM000000') AS sku,
+  'Product ' || p.gs::text          AS product_name,
+  l.category_id                      AS category_id,
+  'each'                             AS unit,
+  true                               AS active,
+  now() - random()*365 * interval '1 day' AS created_at
+FROM prod p
+CROSS JOIN leaf_cnt c
+JOIN leaf l
+  ON l.rn = ((p.rn - 1) % c.cnt) + 1;
 
-SELECT setval('products_product_id_seq', 200);
-
--- =============================================================
--- 3. 가격 이력 SCD Type-2
---    상품당 2~3구간 가격 이력 (valid_to NULL = 현재)
--- =============================================================
--- 구간 1 : 초기 가격 (7개월 전 ~ 4개월 전)
-INSERT INTO product_prices(product_id, price, valid_from, valid_to)
+-- 상품·공급사 매핑 : 행마다 LATERAL 랜덤 선택 (고정화 방지)
+INSERT INTO product_suppliers(product_id, supplier_id, primary_supplier)
 SELECT
-    p.product_id,
-    p.base_price * 1.10 AS price,          -- 최초 가격은 10% 높음
-    CURRENT_DATE - INTERVAL '210 days',
-    CURRENT_DATE - INTERVAL '120 days'
+  p.product_id,
+  s.supplier_id,
+  (random() < 0.2)
+FROM products p
+CROSS JOIN LATERAL (
+  SELECT supplier_id
+  FROM suppliers
+  ORDER BY random()
+  LIMIT 1
+) s;
+
+-- =============================================================
+-- 2. 가격 이력 (SCD2) : 과거 2구간 + 현재 1구간
+-- =============================================================
+
+-- 과거 1 : 365~180일 전
+INSERT INTO product_prices(product_id, price, currency, valid_from, valid_to, is_current)
+SELECT p.product_id,
+      round((10 + random()*190)::numeric, 2),
+      'USD',
+      now() - interval '365 days',
+      now() - interval '180 days',
+      false
 FROM products p;
 
--- 구간 2 : 중간 가격 (4개월 전 ~ 1개월 전)
-INSERT INTO product_prices(product_id, price, valid_from, valid_to)
-SELECT
-    p.product_id,
-    p.base_price * 1.05,
-    CURRENT_DATE - INTERVAL '120 days',
-    CURRENT_DATE - INTERVAL '30 days'
+-- 과거 2 : 180~30일 전
+INSERT INTO product_prices(product_id, price, currency, valid_from, valid_to, is_current)
+SELECT p.product_id,
+      round((10 + random()*190)::numeric, 2),
+      'USD',
+      now() - interval '180 days',
+      now() - interval '30 days',
+      false
 FROM products p;
 
--- 구간 3 : 현재 가격 (1개월 전 ~ 현재, valid_to NULL)
-INSERT INTO product_prices(product_id, price, valid_from, valid_to)
-SELECT
-    p.product_id,
-    p.base_price,
-    CURRENT_DATE - INTERVAL '30 days',
-    NULL
+-- 현재 : 30일 전 ~ 365일 후
+INSERT INTO product_prices(product_id, price, currency, valid_from, valid_to, is_current)
+SELECT p.product_id,
+      round((10 + random()*190)::numeric, 2),
+      'USD',
+      now() - interval '30 days',
+      now() + interval '365 days',
+      true
 FROM products p;
 
 -- =============================================================
--- 4. 재고 (일부 품목 재주문시점 미달 — Q7 결과 확보)
---    product_id 홀수 : 재고 충분, 짝수 중 일부 : 재고 부족
+-- 3. 재고 : 기본 적재 후 50개 상품을 임계치 미달로 강제 (Q7)
 -- =============================================================
-INSERT INTO inventory(product_id, stock, reorder_point)
-SELECT
-    s.n,
-    CASE
-        WHEN s.n % 4 = 0 THEN 5          -- 재고 5개 (재주문시점 20 미달)
-        WHEN s.n % 4 = 2 THEN 18         -- 재고 18개 (재주문시점 미달)
-        WHEN s.n % 3 = 0 THEN 200        -- 재고 충분
-        ELSE 80
-    END AS stock,
-    CASE
-        WHEN s.n % 4 IN (0,2) THEN 30    -- 재주문시점 30
-        ELSE 20
-    END AS reorder_point
-FROM generate_series(1, 200) s(n);
+
+INSERT INTO inventory(product_id, qty_on_hand, reorder_point, updated_at)
+SELECT p.product_id,
+      (20 + (random()*400)::int),
+      30,
+      now()
+FROM products p;
+
+UPDATE inventory i
+SET qty_on_hand = (random()*10)::int,
+    reorder_point = 30,
+    updated_at = now()
+WHERE i.product_id IN (SELECT product_id FROM products ORDER BY random() LIMIT 50);
 
 -- =============================================================
--- 5. 고객 500명
+-- 4. 고객 3,000 + 배송지 (기본 1 + 약 35% 추가 1)
 -- =============================================================
-INSERT INTO customers(customer_id, name, email, channel, signup_date)
-SELECT
-    s.n,
-    '고객_' || LPAD(s.n::TEXT, 3, '0'),
-    'customer' || s.n || '@example.com',
-    -- 채널 분포 : web 50%, mobile 35%, marketplace 15%
-    CASE
-        WHEN s.n % 20 < 10 THEN 'web'
-        WHEN s.n % 20 < 17 THEN 'mobile'
-        ELSE 'marketplace'
-    END,
-    CURRENT_DATE - (((s.n * 7) % 365) || ' days')::INTERVAL
-FROM generate_series(1, 500) s(n);
 
-SELECT setval('customers_customer_id_seq', 500);
+INSERT INTO customers(email, full_name, phone, created_at, marketing_opt_in, country_code)
+SELECT 'user' || gs::text || '@example.com',
+      'Customer ' || gs::text,
+      '+82-10-' || lpad((10000000 + gs)::text,8,'0'),
+      now() - random()*720 * interval '1 hour',
+      (random() < 0.4),
+      (ARRAY['US','KR','JP','DE','GB'])[1 + (random()*4)::int]
+FROM generate_series(1,3000) gs;
+
+-- 기본 배송지
+INSERT INTO addresses(customer_id, line1, line2, city, state, postal_code, country_code, is_default, created_at)
+SELECT c.customer_id,
+      'Street ' || (1 + (random()*999)::int),
+      NULL,
+      (ARRAY['Seoul','Busan','New York','London','Tokyo','Berlin'])[1 + (random()*5)::int],
+      NULL,
+      lpad((10000 + (random()*89999)::int)::text,5,'0'),
+      COALESCE(c.country_code, 'US'),
+      true,
+      now() - random()*365 * interval '1 day'
+FROM customers c;
+
+-- 추가 배송지 (~35%)
+INSERT INTO addresses(customer_id, line1, line2, city, state, postal_code, country_code, is_default, created_at)
+SELECT c.customer_id,
+      'Apt ' || (1 + (random()*999)::int),
+      'Unit ' || (1 + (random()*30)::int),
+      (ARRAY['Seoul','Busan','New York','London','Tokyo','Berlin'])[1 + (random()*5)::int],
+      NULL,
+      lpad((10000 + (random()*89999)::int)::text,5,'0'),
+      COALESCE(c.country_code, 'US'),
+      false,
+      now() - random()*365 * interval '1 day'
+FROM customers c
+WHERE random() < 0.35;
 
 -- =============================================================
--- 6. 쿠폰
+-- 5. 주문
 -- =============================================================
-INSERT INTO coupons(code, discount_rate, valid_from, valid_to) VALUES
-  ('SAVE10', 10.00, '2026-01-01', '2026-12-31'),
-  ('SUMMER5',  5.00, '2026-06-01', '2026-08-31'),
-  ('NEWUSER15',15.00, '2026-01-01', '2026-12-31');
 
--- =============================================================
--- 7. 주문 헤더 (약 3,000건)
---    최근 6개월 분포, status/channel 다양, 일부 쿠폰 적용
--- =============================================================
-INSERT INTO orders(order_id, customer_id, channel, status, order_date, coupon_code)
-SELECT
-    s.n                                              AS order_id,
-    -- 고객 1~500 순환 (VIP 고객 집중 설계 — 상위 1% Q10용)
-    CASE
-        WHEN s.n <= 500 THEN (s.n - 1) % 5 + 1     -- 고객 1~5: 초고빈도 (100주문씩)
-        WHEN s.n <= 1500 THEN ((s.n - 501) % 45) + 6  -- 고객 6~50: 중빈도
-        ELSE ((s.n - 1501) % 450) + 51              -- 고객 51~500: 저빈도
-    END                                              AS customer_id,
-    -- 채널 분포
-    CASE (s.n % 3)
-        WHEN 0 THEN 'web'
-        WHEN 1 THEN 'mobile'
-        ELSE 'marketplace'
-    END                                              AS channel,
-    -- 상태 분포 (유효거래 다수, 취소/환불 소수)
-    CASE
-        WHEN s.n % 20 = 0 THEN 'cancelled'
-        WHEN s.n % 25 = 0 THEN 'refunded'
-        WHEN s.n % 7 = 0  THEN 'created'
-        WHEN s.n % 5 = 0  THEN 'paid'
-        WHEN s.n % 3 = 0  THEN 'shipped'
+-- (A) 일반 고객 : 고객당 0~4건 · 상태 혼합 (r 은 행당 1회 평가)
+INSERT INTO orders(customer_id, order_status, order_ts, shipping_address_id, coupon_code, channel)
+SELECT c.customer_id,
+      CASE
+        WHEN rr.r < 0.08 THEN 'created'
+        WHEN rr.r < 0.18 THEN 'cancelled'
+        WHEN rr.r < 0.26 THEN 'refunded'
+        WHEN rr.r < 0.52 THEN 'paid'
+        WHEN rr.r < 0.72 THEN 'shipped'
         ELSE 'delivered'
-    END                                              AS status,
-    -- 주문 일시 : 최근 180일 내 균등 분포
-    NOW() - ((s.n % 180) || ' days')::INTERVAL
-        - ((s.n % 86400) || ' seconds')::INTERVAL   AS order_date,
-    -- 쿠폰 : 약 15% 주문에 적용
+      END AS order_status,
+      now() - random()*120 * interval '1 day' AS order_ts,
+      (SELECT address_id
+        FROM addresses a
+        WHERE a.customer_id = c.customer_id
+        ORDER BY random()
+        LIMIT 1),
+      CASE WHEN random() < 0.22 THEN 'SAVE10' END,
+      (ARRAY['web','mobile','marketplace'])[1 + (random()*2)::int]
+FROM customers c
+CROSS JOIN LATERAL generate_series(1, ((random() + c.customer_id*0)*4)::int) g  -- 외부 참조로 상수 접힘 방지(고객별 난수)
+CROSS JOIN LATERAL (
+  -- 외부 참조 포함(상수화 방지) : 행마다 새 난수 보장
+  SELECT (random() + (c.customer_id * 0)) AS r
+) rr;
+
+-- (B) 헤비 고객(1~30) : 최근 60일 유효 매출 주문 10~24건 (Q10)
+INSERT INTO orders(customer_id, order_status, order_ts, shipping_address_id, coupon_code, channel)
+SELECT c.customer_id,
+      (ARRAY['paid','shipped','delivered'])[1 + (random()*2)::int],
+      now() - random()*60 * interval '1 day',
+      (SELECT address_id
+        FROM addresses a
+        WHERE a.customer_id = c.customer_id
+        ORDER BY random()
+        LIMIT 1),
+      CASE WHEN random() < 0.35 THEN 'SAVE10' END,
+      (ARRAY['web','mobile','marketplace'])[1 + (random()*2)::int]
+FROM customers c
+CROSS JOIN LATERAL generate_series(1, 10 + (random()*14)::int) g
+WHERE c.customer_id BETWEEN 1 AND 30;
+
+-- =============================================================
+-- 6. 주문 상세 : 주문 시점 유효 가격 매칭 + 쿠폰 효과 반영
+-- =============================================================
+
+INSERT INTO order_items(order_id, product_id, qty, unit_price, discount)
+SELECT o.order_id,
+      x.product_id,
+      x.qty,
+      x.unit_price,
+      x.discount
+FROM orders o
+CROSS JOIN LATERAL generate_series(
+  1,
+  CASE
+    WHEN o.coupon_code IS NOT NULL THEN 2 + (random()*3)::int   -- 쿠폰 주문 2~5개 품목
+    ELSE 1 + (random()*3)::int                                  -- 일반 주문 1~4개 품목
+  END
+) g
+CROSS JOIN LATERAL (
+  WITH picked AS (
+    SELECT
+      p.product_id,
+      pp.price AS unit_price,
+      CASE
+        WHEN o.coupon_code IS NOT NULL THEN 1 + (random()*4)::int
+        ELSE 1 + (random()*3)::int
+      END AS qty
+    FROM products p
+    JOIN product_prices pp
+      ON pp.product_id = p.product_id
+    AND o.order_ts >= pp.valid_from AND o.order_ts < pp.valid_to
+    ORDER BY
+      -- 쿠폰 주문은 고가 상품 쪽으로 치우치게 선택
+      CASE WHEN o.coupon_code IS NOT NULL THEN 0 ELSE 1 END,
+      CASE WHEN o.coupon_code IS NOT NULL THEN pp.price END DESC,
+      CASE WHEN o.coupon_code IS NULL THEN random() END,
+      random()
+    LIMIT 1
+  )
+  SELECT
+    product_id,
+    qty,
+    unit_price,
     CASE
-        WHEN s.n % 7 = 0 THEN 'SAVE10'
-        WHEN s.n % 13 = 0 THEN 'SUMMER5'
-        ELSE NULL
-    END                                              AS coupon_code
-FROM generate_series(1, 3000) s(n);
-
-SELECT setval('orders_order_id_seq', 3000);
+      WHEN o.coupon_code = 'SAVE10'
+        THEN round((unit_price * qty) * 0.10, 2)
+      ELSE 0
+    END AS discount
+  FROM picked
+) x;
 
 -- =============================================================
--- 8. 주문 상세 (order_items)
---    주문당 1~3개 라인아이템, 현재 유효 가격 적용
+-- 7. 재구매 보장 (Q6) : 200명이 첫 구매 후 7~25일 내 재구매
 -- =============================================================
--- 라인 1 : 모든 주문에 1개 (상품 순환)
-INSERT INTO order_items(order_id, product_id, qty, unit_price)
-SELECT
-    o.order_id,
-    1 + (o.order_id % 200)                           AS product_id,
-    1 + (o.order_id % 3)                             AS qty,
-    pp.price                                          AS unit_price
+
+WITH paid_orders AS (
+  SELECT customer_id, order_id, order_ts
+  FROM orders
+  WHERE order_status IN ('paid','shipped','delivered')
+),
+first_buy AS (
+  SELECT customer_id, min(order_ts) AS first_ts
+  FROM paid_orders
+  GROUP BY customer_id
+),
+target AS (
+  SELECT customer_id, first_ts
+  FROM first_buy
+  WHERE customer_id NOT BETWEEN 1 AND 30
+  ORDER BY random()
+  LIMIT 200
+),
+ins_orders AS (
+  INSERT INTO orders(customer_id, order_status, order_ts, shipping_address_id, coupon_code, channel)
+  SELECT t.customer_id,
+        (ARRAY['paid','delivered'])[1 + (random()*1)::int],
+        t.first_ts + ((7 + (random()*18)::int) || ' days')::interval,
+        (SELECT address_id FROM addresses a WHERE a.customer_id = t.customer_id ORDER BY random() LIMIT 1),
+        CASE WHEN random() < 0.25 THEN 'SAVE10' END,
+        (ARRAY['web','mobile','marketplace'])[1 + (random()*2)::int]
+  FROM target t
+  RETURNING order_id, order_ts, coupon_code
+)
+INSERT INTO order_items(order_id, product_id, qty, unit_price, discount)
+SELECT o.order_id,
+      x.product_id,
+      x.qty,
+      x.unit_price,
+      x.discount
+FROM ins_orders o
+CROSS JOIN LATERAL generate_series(
+  1,
+  CASE WHEN o.coupon_code IS NOT NULL THEN 2 + (random()*2)::int ELSE 1 + (random()*2)::int END
+) g
+CROSS JOIN LATERAL (
+  WITH picked AS (
+    SELECT
+      p.product_id,
+      pp.price AS unit_price,
+      CASE WHEN o.coupon_code IS NOT NULL THEN 1 + (random()*3)::int ELSE 1 + (random()*2)::int END AS qty
+    FROM products p
+    JOIN product_prices pp
+      ON pp.product_id = p.product_id
+    AND o.order_ts >= pp.valid_from AND o.order_ts < pp.valid_to
+    ORDER BY random()
+    LIMIT 1
+  )
+  SELECT
+    product_id,
+    qty,
+    unit_price,
+    CASE WHEN o.coupon_code='SAVE10' THEN round((unit_price * qty)*0.10, 2) ELSE 0 END AS discount
+  FROM picked
+) x;
+
+-- =============================================================
+-- 8. 결제 · 배송 (주문 상태와 정합)
+-- =============================================================
+
+INSERT INTO payments(order_id, method, amount, paid_at)
+SELECT o.order_id,
+      (ARRAY['card','bank','paypal','cod'])[1 + (random()*3)::int],
+      COALESCE(
+        (SELECT round(sum(oi.qty * oi.unit_price - oi.discount), 2)
+          FROM order_items oi
+          WHERE oi.order_id = o.order_id),
+        0
+      ) AS amount,
+      o.order_ts + (random()*2) * INTERVAL '1 hour'
 FROM orders o
-JOIN product_prices pp
-  ON pp.product_id = 1 + (o.order_id % 200)
- AND pp.valid_to IS NULL;
+WHERE o.order_status IN ('paid','shipped','delivered','refunded');
 
--- 라인 2 : 짝수 주문에 추가 (다른 상품)
-INSERT INTO order_items(order_id, product_id, qty, unit_price)
-SELECT
-    o.order_id,
-    1 + ((o.order_id + 50) % 200)                    AS product_id,
-    1 + (o.order_id % 2)                             AS qty,
-    pp.price                                          AS unit_price
+INSERT INTO shipments(order_id, carrier, tracking_no, shipped_at, delivered_at)
+SELECT o.order_id,
+      (ARRAY['DHL','UPS','FedEx','CJ','Kerry'])[1 + (random()*4)::int],
+      'TRK' || o.order_id::text,
+      o.order_ts + interval '1 day',
+      CASE WHEN o.order_status = 'delivered' THEN o.order_ts + interval '3 days' END
 FROM orders o
-JOIN product_prices pp
-  ON pp.product_id = 1 + ((o.order_id + 50) % 200)
- AND pp.valid_to IS NULL
-WHERE o.order_id % 2 = 0;
-
--- 라인 3 : 3의 배수 주문에 추가 (또 다른 상품)
-INSERT INTO order_items(order_id, product_id, qty, unit_price)
-SELECT
-    o.order_id,
-    1 + ((o.order_id + 100) % 200)                   AS product_id,
-    2                                                 AS qty,
-    pp.price                                          AS unit_price
-FROM orders o
-JOIN product_prices pp
-  ON pp.product_id = 1 + ((o.order_id + 100) % 200)
- AND pp.valid_to IS NULL
-WHERE o.order_id % 3 = 0;
+WHERE o.order_status IN ('shipped','delivered');
 
 -- =============================================================
--- 9. 리뷰 (약 2,000건)
---    상품 1~20 : 리뷰 100개 이상, 평균 4.5↑ (Q8 효자상품)
---    나머지 : 적은 리뷰, 낮은 평점도 포함
+-- 9. 리뷰 (Q8) : 히어로 상품 12개(평점 4.5+ · 리뷰 다수) + 롱테일
 -- =============================================================
--- 효자 상품 (product_id 1~20) : 고평점 대량 리뷰
-INSERT INTO reviews(product_id, customer_id, rating, review_date, content)
-SELECT
-    1 + (s.n % 20)                                   AS product_id,
-    1 + (s.n % 500)                                  AS customer_id,
-    -- 평균 약 4.6 (5,5,5,4,5 패턴)
-    CASE s.n % 5
-        WHEN 0 THEN 4
-        ELSE 5
-    END                                              AS rating,
-    CURRENT_DATE - (s.n % 90 || ' days')::INTERVAL  AS review_date,
-    '만족스러운 구매였습니다.'
-FROM generate_series(1, 1200) s(n);
 
--- 일반 상품 (product_id 21~200) : 소량·다양한 평점
-INSERT INTO reviews(product_id, customer_id, rating, review_date, content)
-SELECT
-    21 + (s.n % 180)                                 AS product_id,
-    1 + (s.n % 500)                                  AS customer_id,
-    1 + (s.n % 5)                                    AS rating,
-    CURRENT_DATE - (s.n % 180 || ' days')::INTERVAL AS review_date,
-    '상품 후기입니다.'
-FROM generate_series(1, 800) s(n);
+WITH hero_products AS (
+  SELECT product_id
+  FROM products
+  ORDER BY random()
+  LIMIT 12
+),
+reviewers AS (
+  SELECT customer_id
+  FROM customers
+  ORDER BY random()
+  LIMIT 1500
+),
+pairs AS (
+  SELECT hp.product_id, r.customer_id,
+        CASE WHEN random() < 0.78 THEN 5 ELSE 4 END AS rating
+  FROM hero_products hp
+  CROSS JOIN LATERAL (
+    SELECT customer_id FROM reviewers ORDER BY random() LIMIT 160
+  ) r
+)
+INSERT INTO reviews(product_id, customer_id, rating, review_text, created_at)
+SELECT product_id, customer_id, rating,
+      'Great product ' || product_id::text,
+      now() - random()*120 * interval '1 day'
+FROM pairs
+ON CONFLICT (product_id, customer_id) DO NOTHING;
 
-COMMIT;
+-- 롱테일 랜덤 리뷰 (~22% 상품)
+INSERT INTO reviews(product_id, customer_id, rating, review_text, created_at)
+SELECT p.product_id, c.customer_id,
+      1 + (random()*4)::int,
+      'Review ' || p.product_id::text,
+      now() - random()*180 * interval '1 day'
+FROM products p
+JOIN LATERAL (SELECT customer_id FROM customers ORDER BY random() LIMIT 1) c ON true
+WHERE random() < 0.22
+ON CONFLICT (product_id, customer_id) DO NOTHING;
 
 -- =============================================================
--- 적재 결과 확인 (행수 출력)
+-- 10. 마무리 : 안전 나눗셈 UDF(Q11) + MView 갱신 + 통계 수집
 -- =============================================================
-SELECT
-    'categories'    AS tbl, COUNT(*) AS rows FROM categories UNION ALL
-SELECT 'products',           COUNT(*) FROM products           UNION ALL
-SELECT 'product_prices',     COUNT(*) FROM product_prices     UNION ALL
-SELECT 'inventory',          COUNT(*) FROM inventory          UNION ALL
-SELECT 'customers',          COUNT(*) FROM customers          UNION ALL
-SELECT 'coupons',            COUNT(*) FROM coupons            UNION ALL
-SELECT 'orders',             COUNT(*) FROM orders             UNION ALL
-SELECT 'order_items',        COUNT(*) FROM order_items        UNION ALL
-SELECT 'reviews',            COUNT(*) FROM reviews
-ORDER BY tbl;
+
+-- 0/NULL 분모 방어 (SQL 버전)
+CREATE OR REPLACE FUNCTION safe_div(n numeric, d numeric)
+RETURNS numeric
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT CASE WHEN d IS NULL OR d = 0 THEN NULL ELSE n / d END
+$$;
+
+-- MView 는 자동 갱신되지 않으므로 적재 직후 갱신
+REFRESH MATERIALIZED VIEW mv_daily_gmv;
+
+-- 플래너 통계 최신화 (실행계획 실습 전 필수)
+ANALYZE;
